@@ -1,18 +1,16 @@
-  
-#include <pt.h>
-#include "FastLED.h"
+#include <FastLED.h>
 
 /*==============================================================================*/
 /* LED und Arduino Variablen */
 /*==============================================================================*/
 
-#define NUM_LEDS             40                // Number of LEDs
+#define NUM_LEDS             188                // Number of LEDs
 #define MAX_ARGS             10                 // Max Number of command arguments
 #define BAUDRATE             500000             // Baudrate
-#define SERIAL               Serial            // Serial port for communication
+#define SERIAL               Serial             // Serial port for communication
 #define SERIAL_DEBUG         Serial             // Serial port for debugging
 #define DATA_PIN             6                  // PIN where LEDs are connected/Used for TM1809/WS2811 chipsets, because they dont use SPI
-//#define CLOCK_PIN           4                  // used for some SPI chipsets, e.g. WS2801 
+//#define CLOCK_PIN           4                  // used for some SPI chipsets, e.g. WS2801
 #define BRIGHTNESS           255                // define global brightness 0..255
 
 //choose your LED chipset in void setup()
@@ -23,20 +21,23 @@
 
 enum Protocol
 {
-   // positions
-   posStart      = 0,
-   posType       = 1,
-   posFsHigh     = 2,
-   posFsLow      = 3,
-   posData       = 4,
+   // states
+   stateStart    = 0,
+   stateType     = 1,
+   stateFsHigh   = 2,
+   stateFsLow    = 3,
+   stateData     = 4,
+   stateEnd      = 5,
+   stateComplete = 6,
+   stateError    = 7,
 
-   // bytes 
+   // bytes
    tpm2Start     = 0xc9,
    tpm2DataFrame = 0xda,
    tpm2Command   = 0xc0,
    tpm2Answer    = 0xaa,
    tpm2End       = 0x36,
-   tpm2Ack       = 0xAC
+   tpm2Ack       = 0xac
 };
 
 enum Mode
@@ -46,38 +47,99 @@ enum Mode
    mProgram
 };
 
-struct Data
-{
-   int pos;
-   uint8_t type;
-   uint16_t fs;
-   uint8_t command;
-   CRGB rgb[NUM_LEDS];
+struct Data {
+	uint8_t type;
+	union {
+		uint16_t fs;
+		struct {
+			uint8_t fsLow;
+			uint8_t fsHigh;
+		};
+	};
+	CRGB rgb[NUM_LEDS];
 } data;
 
+volatile uint16_t dataIndex = 0;
+volatile uint8_t state = stateStart;
+
 byte args[MAX_ARGS];
-unsigned long lastDataAt = 0;
-int program = 0;            
+int program = 0;
 int mode = mNone;
-int effectDelay = 100;
-static struct pt pt1;
+unsigned long effectDelay = 100;
+
+
+/*==============================================================================*/
+/* Replace Arduino's ISR */
+/*==============================================================================*/
+
+// !!! in HardwareSerial, disable ISR(USART_RX_vect)
+
+ISR(USART_RX_vect) {
+	uint8_t c = UDR0;
+	switch(state) {
+		case stateStart:
+			if(c == tpm2Start) {                            // wait for start byte
+				state = stateType;
+			}
+			break;
+		case stateType:
+			data.type = c;                                  // type
+			state = stateFsHigh;
+			break;
+		case stateFsHigh:
+			data.fsHigh = c;                                // fs high byte
+			state = stateFsLow;
+			break;
+		case stateFsLow:
+			data.fsLow = c;                                 // fs low byte
+			dataIndex = 0;
+			state = stateData;
+			break;
+		case stateData:
+			if(dataIndex < sizeof(data.rgb)) {              // if buffer not full, store byte
+				data.rgb->raw[dataIndex++] = c;
+			} else {
+				dataIndex++;
+			}
+			if(dataIndex >= data.fs) {                      // if transfer complete
+				state = stateEnd;
+			}
+			break;
+		case stateEnd:
+			if(data.fs > sizeof(data.rgb)) {                // if more bytes transferred than the size of our buffer, fix it
+				data.fs = sizeof(data.rgb);
+			}
+			if(c == tpm2End) {
+				state = stateComplete;
+			} else {
+				state = stateError;
+			}
+			break;
+		case stateComplete:                                 // and we're done
+		case stateError:
+			break;
+		default:
+			state = stateStart;
+			break;
+	}
+}
 
 /*==============================================================================*/
 /* Variablen für Effekte */
 /*==============================================================================*/
- 
+
 int BOTTOM_INDEX = 0;
 int TOP_INDEX = int(NUM_LEDS/2);
 int EVENODD = NUM_LEDS%2;
 
 /*==============================================================================*/
-/* debug code
+/* debug code */
 /*==============================================================================*/
 
-// comment this line out to disable debugging 
+// comment this line out to disable debugging
 
 //#define DEBUG
- 
+
 #ifdef DEBUG
 
 void debug(const char* str)
@@ -86,27 +148,53 @@ void debug(const char* str)
 }
 
 void debug(const char* str, uint16_t val, int fmt = DEC)
-{   
+{
    SERIAL_DEBUG.print(str);
    SERIAL_DEBUG.println(val, fmt);
 }
 
-int freeRam() 
+int freeRam()
 {
-   extern int __heap_start, *__brkval; 
-   int v; 
-   return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval); 
+   extern int __heap_start, *__brkval;
+   int v;
+   return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
 }
 
 #else
-#  define debug( ... ) 
+#  define debug( ... )
 #endif
+
+/*==============================================================================*/
+/* prototypes */
+/*==============================================================================*/
+
+void setLedColor(int led, uint8_t, uint8_t, uint8_t);
+void showLeds();
+void setProgram();
+void playProgram();
+void playProgramThread();
+void oneColorAll(uint8_t, uint8_t, uint8_t);
+void loopRGBPixel(int);
+void rainbow_fade(int);
+void rainbow_loop(int);
+void random_burst(int);
+void flicker(int, int);
+void colorBounce(int, int);
+void pulse_oneColorAll(int, int, int, int);
+void police_light_strobo(int);
+void police_lightsALL(int);
+void police_lightsONE(int);
+int antipodal_index(int);
+
+/*==============================================================================*/
+/* setup */
+/*==============================================================================*/
 
 void setup()
 {
-   SERIAL.begin(BAUDRATE);
-   delay(1000);  
-   memset(data.rgb, 0, sizeof(struct CRGB) * NUM_LEDS); 
+	SERIAL.begin(BAUDRATE);
+	delay(1000);
+	// memset(data.rgb, 0, sizeof(struct CRGB) * NUM_LEDS);
 
    // Uncomment one of the following lines for your leds arrangement.
    // FastLED.addLeds<TM1803, DATA_PIN, RGB>(data.rgb, NUM_LEDS);
@@ -125,11 +213,12 @@ void setup()
    // FastLED.addLeds<WS2801, DATA_PIN, CLOCK_PIN, RGB>(data.rgb, NUM_LEDS);
    // FastLED.addLeds<SM16716, DATA_PIN, CLOCK_PIN, RGB>(data.rgb, NUM_LEDS);
    // FastLED.addLeds<LPD8806, DATA_PIN, CLOCK_PIN, RGB>(data.rgb, NUM_LEDS);
-   
-   FastLED.addLeds<WS2811, DATA_PIN, RGB>(data.rgb, NUM_LEDS);
+
+   // FastLED.addLeds<WS2811, DATA_PIN, RGB>(data.rgb, NUM_LEDS);
+   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(data.rgb, NUM_LEDS);
    FastLED.setBrightness(BRIGHTNESS);
-   
-   oneColorAll(255,0,0);
+
+   oneColorAll(0,0,0);
 #ifdef DEBUG
    SERIAL_DEBUG.begin(BAUDRATE);
    // wait for serial port to connect. Needed for Leonardo only
@@ -137,243 +226,78 @@ void setup()
       delay(1);
    SERIAL_DEBUG.println("Setup done");
 #endif
-   memset(args, 0, MAX_ARGS);
-   resetVars();
-   PT_INIT(&pt1);
 }
 
 /*==============================================================================*/
-/* Thread für Programm/Effekte
-/*==============================================================================*/
-
-static int playProgramThread(struct pt *pt) 
-{
-   static unsigned long timestamp = 0;
-   PT_BEGIN(pt);
-   while(1) 
-   {
-      PT_WAIT_UNTIL(pt, millis() - timestamp > effectDelay);
-      playProgram();
-      timestamp = millis();
-   }
-   PT_END(pt);
-}
-
-/*==============================================================================*/
-/* loop
+/* loop */
 /*==============================================================================*/
 
 void loop()
 {
-  while (1)
-  {
-   // if data available switch to communication mode
-   if (SERIAL.available() > 0)
-   {
-      if (mode != mCommunication)
-      {
-         debug("switching to communication mode");
-         mode = mCommunication;
-         resetVars();
-      }
-      doCommunication();
-   }
-   else
-   // communication timeout after 0.5 seconds
-   while (SERIAL.available() == 0 && millis()-lastDataAt > 1000)
-   {
-      if (mode != mProgram)
-      {
-         debug("switching to prg mode, ignoring ", data.pos);
-         mode = mProgram;
-         resetVars();
-      }
-      else
-        playProgramThread(&pt1);
-   }
-  }
+	while (1) {
+		switch(state) {
+			case stateComplete:
+				if(data.fs < sizeof(data.rgb)) {                     // if received buffer not full, clear the rest
+					memset(&data.rgb->raw[data.fs], 0, sizeof(data.rgb) - data.fs);
+				}
+				switch(data.type) {
+					case tpm2DataFrame:
+						mode = mCommunication;
+						showLeds();                                  // we received data, show it
+						break;
+					case tpm2Command:
+						mode = mProgram;
+						setProgram();                                // we received a command, start program
+						state = stateStart;
+						playProgram();
+						break;
+				}
+				SERIAL.write(tpm2Ack);                               // acknowledge
+				state = stateStart;
+				break;
+			case stateStart:
+				if(mode == mProgram) {
+					playProgramThread();                             // when idle, play the selected program
+				}
+				break;
+			case stateError:
+				debug("error");                                      // oops, something went wrong
+				state = stateStart;
+				break;
+		}
+	}
 }
 
 /*==============================================================================*/
-/* do communication
+/* set LED color */
 /*==============================================================================*/
 
-void doCommunication()
+inline void setLedColor(int led, uint8_t r, uint8_t g, uint8_t b)
 {
-#ifdef DEBUG
-   int count = 0;
-#endif
-
-   // read ...
-
-   while (SERIAL.available() > 0)
-   {
-     
-      byte val = SERIAL.read();
-      lastDataAt = millis();
-
-#ifdef DEBUG
-      debug("got: ", val, HEX);
-      debug("at pos: ", data.pos, DEC);
-      count++;
-#endif
-
-      if (data.pos == posStart && val == tpm2Start)                                    // Startbyte
-         resetVars();
-
-      else if (data.pos == posType && (val == tpm2DataFrame || val == tpm2Command))    // Block-Art
-         data.type = val;
-
-      else if (data.pos == posFsHigh)                                                  // Framesize (High Bit)
-      {
-         data.fs = (val << 8) & 0xFF00;
-         if (data.fs > NUM_LEDS*3)
-         {
-           debug("framsize too high: ", data.fs);
-           resetVars();
-           continue;
-         } 
-      }
-      else if (data.pos == posFsLow)                                                   // Framesize (Low byte)
-      {
-         data.fs += val & 0x00FF;
-         if (data.fs > NUM_LEDS*3)
-         {
-           debug("framsize too high: ", data.fs);
-           resetVars();
-           continue;
-         } 
-      }
-      else if (data.pos == posData + data.fs && val == tpm2End)                        // End Byte
-         parsePacket();
-
-      else if (data.pos >= posData && data.pos < posData+data.fs)                      // Bytes zwischen Header und Ende lesen
-         evaluateData(val);
-
-      else                                                                             // protocol violation ...
-      {
-         if (data.pos != 0)
-         {
-            debug("protocol violation at pos: ", data.pos);
-            debug("val was: ", val);
-         }
-          debug("Error");
-         resetVars();
-         continue;
-      }
-      data.pos++;
-   }
-
-#ifdef DEBUG
-   if (count)
-      debug("received", count, DEC);
-#endif
+   data.rgb[led].r = r;
+   data.rgb[led].g = g;
+   data.rgb[led].b = b;
 }
 
 /*==============================================================================*/
-/* evaluate data
+/* Output Leds */
 /*==============================================================================*/
 
-void evaluateData(byte val)
+inline void showLeds()
 {
-   if (data.type == tpm2DataFrame)        // frame data
-   {
-      uint8_t* rgb = (uint8_t*)data.rgb;
-      rgb[data.pos-posData] = val;
-   }
-
-   else                                  // command data
-   {
-      if (data.pos == posData)
-      {
-         data.command = val;
-         memset(args, 0, sizeof(args));  
-      }
-      else
-         args[data.pos-posData-1] = val;
-   }
-}
-
-/*==============================================================================*/
-/* reset variables
-/*==============================================================================*/
-
-void resetVars()
-{
-   debug("Reset");
-   memset(&data, 0, sizeof(Data));
-   //data.rgb = (struct CRGB*)FastSPI_LED.getRGBData();
-   memset(data.rgb, 0,  NUM_LEDS * sizeof(struct CRGB));
-}
-
-/*==============================================================================*/
-/* parse packet
-/*==============================================================================*/
-
-void parsePacket()
-{
-   debug("Parse");
-
-   switch (data.type)
-   {
-      case tpm2DataFrame:
-      {
-         showLeds();
-         break;
-      }
-      case tpm2Command: 
-      {
-         setProgram();
-         break;
-      }
-      default: 
-         break;
-   }
-
-   SERIAL.write(tpm2Ack);
-   resetVars();
-   data.pos = -1;
-}
-
-/*==============================================================================*/
-/* set LED color
-/*==============================================================================*/
-
-void setLedColor(int led, uint8_t r, uint8_t g, uint8_t b)
-{
-   data.rgb[led].r = r; 
-   data.rgb[led].g = g; 
-   data.rgb[led].b = b; 
-}
-
-/*==============================================================================*/
-/* one Color All
-/*==============================================================================*/
-
-void oneColorAll(uint8_t r, uint8_t g, uint8_t b)
-{
-   memset(data.rgb, 0, NUM_LEDS * sizeof(struct CRGB));
-
-   for (int led = 0; led < NUM_LEDS; led++)
-      setLedColor(led, r, g, b);
-
-   showLeds();
-   effectDelay = 1000;
-}
-
-/*==============================================================================*/
-/* Output Leds
-/*==============================================================================*/
-
-void showLeds()
-{
+	debug("showLeds");
     FastLED.show();
 }
 
+/*==============================================================================*/
+/* Programs */
+/*==============================================================================*/
 
 void setProgram()
 {
-   program = data.command;
+	program = data.rgb->raw[0];
+	memcpy(args, &data.rgb->raw[1], sizeof(args));
+	debug("setProgram ", program);
 }
 
 void playProgram()
@@ -392,29 +316,37 @@ void playProgram()
       case  9: police_light_strobo(50);                break;
       case 10: police_lightsALL(20);                   break;
       case 11: police_lightsONE(20);                   break;
-      default: oneColorAll(0,0,0);        break;
+      default: oneColorAll(0,0,0);                     break;
    }
 }
 
-/* Set LED Color of given LED */
-
-void oneColorAllNOSHOW(int r, int g, int b)
+void playProgramThread()
 {
-   resetVars();
-   for (int led = 0; led < NUM_LEDS; led++)
-   {
-      setLedColor(led, r, g, b);
-   }
+	static unsigned long timestamp = 0;
 
+	if(millis() - timestamp >= effectDelay) {
+		playProgram();
+		timestamp = millis();
+	}
 }
 
 /*==============================================================================*/
-/* Effect 0: Fixed color - Arguments RR GG BB
+/* Effect 0: Fixed color - Arguments RR GG BB */
 /*==============================================================================*/
 
+void oneColorAll(uint8_t r, uint8_t g, uint8_t b)
+{
+	if(state == stateStart) {                           // don't overwrite ISR data
+		for (int led = 0; led < NUM_LEDS; led++) {
+			data.rgb[led] = CRGB(r,g,b);
+		}
+		showLeds();
+	}
+	effectDelay = 1000;
+}
 
 /*==============================================================================*/
-/* Effect 1: Loops each RGB color through each Pixel
+/* Effect 1: Loops each RGB color through each Pixel */
 /*==============================================================================*/
 
 void loopRGBPixel(int idelay) //OK
@@ -432,15 +364,15 @@ void loopRGBPixel(int idelay) //OK
 
    memset(data.rgb, 0, NUM_LEDS*3);
 
-   switch (c) 
-   { 
-      case 0:   
-         data.rgb[i].r =200; 
-         break; 
-      case 1: 
-         data.rgb[i].g =200; 
+   switch (c)
+   {
+      case 0:
+         data.rgb[i].r =200;
          break;
-      case 2: 
+      case 1:
+         data.rgb[i].g =200;
+         break;
+      case 2:
          data.rgb[i].b =200;
          break;
    }
@@ -450,7 +382,7 @@ void loopRGBPixel(int idelay) //OK
 }
 
 /*==============================================================================*/
-/* Effect 2: Fade through raibow colors over all LEDs
+/* Effect 2: Fade through raibow colors over all LEDs */
 /*==============================================================================*/
 
 void rainbow_fade(int idelay) { //OK //-FADE ALL LEDS THROUGH HSV RAINBOW
@@ -467,32 +399,32 @@ void rainbow_fade(int idelay) { //OK //-FADE ALL LEDS THROUGH HSV RAINBOW
 }
 
 /*==============================================================================*/
-/* Effect 3: Loops rainbow colors around the stripe
+/* Effect 3: Loops rainbow colors around the stripe */
 /*==============================================================================*/
 
 void rainbow_loop(int idelay) { //-LOOP HSV RAINBOW
    static double idex = 0;
    static double ihue = 0;
-   double steps = (double)255/NUM_LEDS; 
-   
+   double steps = (double)255/NUM_LEDS;
+
    for(int led = 0 ; led < NUM_LEDS; led++ ) {
       ihue = led * steps + idex;
-      if (ihue >= 255) 
+      if (ihue >= 255)
          ihue -= 255;
 
       data.rgb[led] = CHSV((int)ihue, 255, 255);
 
       if (led == 0)
          idex += steps;
-      if (idex >= 255) 
+      if (idex >= 255)
          idex = 0;
-   }  
+   }
    showLeds();
    effectDelay = idelay;
 }
 
 /*==============================================================================*/
-/* Effect 4: Random burst - Randowm colors on each LED
+/* Effect 4: Random burst - Randowm colors on each LED */
 /*==============================================================================*/
 
 void random_burst(int idelay) { //-RANDOM INDEX/COLOR
@@ -509,7 +441,7 @@ void random_burst(int idelay) { //-RANDOM INDEX/COLOR
 }
 
 /*==============================================================================*/
-/* Effect 5: Flicker effect - random flashing of all LEDs
+/* Effect 5: Flicker effect - random flashing of all LEDs */
 /*==============================================================================*/
 
 void flicker(int thishue, int thissat) {
@@ -517,7 +449,7 @@ void flicker(int thishue, int thissat) {
    int random_delay = random(10,100);
 
    for(int i = 0 ; i < NUM_LEDS; i++ ) {
-      data.rgb[i] = CHSV(thishue, thissat, ibright); 
+      data.rgb[i] = CHSV(thishue, thissat, ibright);
    }
 
    showLeds();
@@ -525,13 +457,13 @@ void flicker(int thishue, int thissat) {
 }
 
 /*==============================================================================*/
-/* Effect 6: Color bounce - bounce a color through whole stripe
+/* Effect 6: Color bounce - bounce a color through whole stripe */
 /*==============================================================================*/
 
 void colorBounce(int ihue, int idelay) { //-BOUNCE COLOR (SINGLE LED)
   static int bouncedirection = 0;
   static int idex = 0;
-  
+
   if (bouncedirection == 0) {
     idex = idex + 1;
     if (idex == NUM_LEDS) {
@@ -544,7 +476,7 @@ void colorBounce(int ihue, int idelay) { //-BOUNCE COLOR (SINGLE LED)
     if (idex == 0) {
       bouncedirection = 0;
     }
-  }  
+  }
   for(int i = 0; i < NUM_LEDS; i++ ) {
     if (i == idex) {
       data.rgb[i] = CHSV(ihue, 255, 255);
@@ -558,17 +490,17 @@ void colorBounce(int ihue, int idelay) { //-BOUNCE COLOR (SINGLE LED)
 }
 
 /*==============================================================================*/
-/* Effect 7/8: Fade in/out a color using brightness/saturation
+/* Effect 7/8: Fade in/out a color using brightness/saturation */
 /*==============================================================================*/
 
-void pulse_oneColorAll(int ahue, int idelay, int steps, int useSat) { //-PULSE BRIGHTNESS ON ALL LEDS TO ONE COLOR 
+void pulse_oneColorAll(int ahue, int idelay, int steps, int useSat) { //-PULSE BRIGHTNESS ON ALL LEDS TO ONE COLOR
   static int bouncedirection = 0;
   static int idex = 0;
   int isteps = 255/steps;
   static int ival = 0;
-  
+
   static int xhue = 0;
-  
+
   if (bouncedirection == 0) {
     ival += isteps;
     if (ival >= 255) {
@@ -580,8 +512,8 @@ void pulse_oneColorAll(int ahue, int idelay, int steps, int useSat) { //-PULSE B
     if (ival <= 0) {
       bouncedirection = 0;
      xhue = random(0, 255);
-    }         
-  }  
+    }
+  }
 
   for(int i = 0 ; i < NUM_LEDS; i++ ) {
     if (useSat == 0)
@@ -593,25 +525,24 @@ void pulse_oneColorAll(int ahue, int idelay, int steps, int useSat) { //-PULSE B
   effectDelay = idelay;
 }
 
-
 /*==============================================================================*/
-/* Effect 9: Police light - red/blue strobo on each half of stripe
+/* Effect 9: Police light - red/blue strobo on each half of stripe */
 /*==============================================================================*/
 
 void police_light_strobo(int idelay)
 {
   int middle = NUM_LEDS/2;
-  static int color = 0;  
+  static int color = 0;
   static int left_right = 0;
-  
+
   if (left_right > 19)
     left_right = 0;
-  
+
   if (color == 1)
     color = 0;
   else
     color = 1;
-    
+
   for (int i = 0; i < NUM_LEDS; i++)
   {
     if (i <= middle && left_right < 10)
@@ -632,18 +563,18 @@ void police_light_strobo(int idelay)
   }
   showLeds();
   effectDelay = idelay;
-  
+
   left_right++;
-  
+
 }
 
 /*==============================================================================*/
-/* Effect 10: Police Light all LEDs 
+/* Effect 10: Police Light all LEDs */
 /*==============================================================================*/
 
 void police_lightsALL(int idelay) { //-POLICE LIGHTS (TWO COLOR SOLID)
   static int idex = 0;
-  
+
   int idexR = idex;
   int idexB = antipodal_index(idexR);
   setLedColor(idexR, 255, 0, 0);
@@ -657,21 +588,21 @@ void police_lightsALL(int idelay) { //-POLICE LIGHTS (TWO COLOR SOLID)
 }
 
 /*==============================================================================*/
-/* Effect 11: Police Light one LED blue and red
+/* Effect 11: Police Light one LED blue and red */
 /*==============================================================================*/
 
 void police_lightsONE(int idelay) { //-POLICE LIGHTS (TWO COLOR SINGLE LED)
   static int idex = 0;
-   
+
   int idexR = idex;
-  int idexB = antipodal_index(idexR);  
+  int idexB = antipodal_index(idexR);
   for(int i = 0; i < NUM_LEDS; i++ ) {
     if (i == idexR) {
       setLedColor(i, 255, 0, 0);
     }
     else if (i == idexB) {
       setLedColor(i, 0, 0, 255);
-    }    
+    }
     else {
       setLedColor(i, 0, 0, 0);
     }
@@ -683,7 +614,7 @@ void police_lightsONE(int idelay) { //-POLICE LIGHTS (TWO COLOR SINGLE LED)
     idex = 0;
   }
 }
-                       
+
 /*==============================================================================*/
 /* Util func Effekte */
 /*==============================================================================*/
@@ -693,8 +624,7 @@ int antipodal_index(int i) {
   //int N2 = int(NUM_LEDS/2);
   int iN = i + TOP_INDEX;
   if (i >= TOP_INDEX) {
-    iN = ( i + TOP_INDEX ) % NUM_LEDS; 
+    iN = ( i + TOP_INDEX ) % NUM_LEDS;
   }
   return iN;
 }
-
